@@ -1,6 +1,6 @@
 # RLM - Recursive Language Models
 
-Implementation of the Recursive Language Models approach from MIT CSAIL paper.
+Implementation of the Recursive Language Models approach from MIT CSAIL paper (arXiv:2512.24601).
 
 ## Project Structure
 
@@ -32,6 +32,243 @@ Edit `config.py` to change:
 - `MAX_RECURSION_DEPTH`: Sub-LLM call depth (default: 3)
 - `CALL_DELAY`: Seconds to wait after each LLM call (default: 15) - important for thinking models
 
+---
+
+## Understanding the Recursive Logic (Visual Guide)
+
+### The Problem: LLMs Have Limited Context Windows
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                YOUR DOCUMENT (e.g., 2MB file)               │
+│                                                             │
+│  ████████████████████████████████████████████████████████   │
+│  ████████████████████████████████████████████████████████   │
+│  ████████████████████████████████████████████████████████   │
+│  ████████████████████████████████████████████████████████   │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│              LLM CONTEXT WINDOW (limited!)                  │
+│  ┌────────────────────┐                                     │
+│  │  Can only fit      │   ← What if document is 10x bigger? │
+│  │  THIS much         │      Or 100x? LLM chokes.           │
+│  └────────────────────┘                                     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Traditional Approach: Stuff It All In (FAILS)
+
+```
+    YOU: "Hey LLM, here's a 2MB document, find the magic number"
+
+         ┌──────────────────────────────────┐
+         │  2MB OF TEXT                     │
+         │  ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓ │
+         │  ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓ │──────► LLM
+         │  ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓ │
+         └──────────────────────────────────┘
+                                                     │
+                                                     ▼
+                                              ❌ FAILS!
+                                              - Doesn't fit
+                                              - "Context rot"
+                                              - Forgets stuff
+```
+
+### RLM Approach: LLM as EXPLORER, Not READER
+
+**Key insight:** Don't send the document. Send TOOLS to explore it.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      YOUR MACHINE (local)                        │
+│                                                                  │
+│   ┌────────────────────────────────────────────────────────┐    │
+│   │  context = "A decoder-only transformer begins..."       │    │
+│   │           (FULL 2MB document stored as a variable)      │    │
+│   │           ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓   │    │
+│   │           ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓   │    │
+│   └────────────────────────────────────────────────────────┘    │
+│                              │                                   │
+│                              │  LLM can only see SMALL pieces    │
+│                              ▼  at a time via code               │
+│   ┌────────────────────────────────────────────────────────┐    │
+│   │  PYTHON REPL                                            │    │
+│   │                                                         │    │
+│   │  >>> print(len(context))                                │    │
+│   │  76543                                                  │    │
+│   │                                                         │    │
+│   │  >>> print(context[0:500])     ◄── LLM "peeks" at start │    │
+│   │  "A decoder-only transformer..."                        │    │
+│   │                                                         │    │
+│   │  >>> print(context.find("attention"))  ◄── LLM searches │    │
+│   │  1842                                                   │    │
+│   └────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              │ Only SMALL outputs go to LLM
+                              ▼
+                    ┌───────────────────┐
+                    │       LLM         │
+                    │  "Ah! Attention   │
+                    │   is at position  │
+                    │   1842. Let me    │
+                    │   read around it" │
+                    └───────────────────┘
+```
+
+### THE RECURSIVE PART: Sub-LLMs
+
+The main LLM can **spawn helper LLMs** to analyze chunks:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           ROOT LLM (the boss)                           │
+│                                                                         │
+│   "This document is 76,000 chars. Too big to understand at once.        │
+│    I'll split it into chunks and ask SUB-LLMs to analyze each."         │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    │ Writes code:
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  for i in range(0, len(context), 10000):                                │
+│      chunk = context[i:i+10000]                                         │
+│      answer = llm_query(f"What's this chunk about? {chunk}")  ◄─────────│
+│      results.append(answer)                                    │        │
+└────────────────────────────────────────────────────────────────│────────┘
+                                                                 │
+                    ┌────────────────────────────────────────────┘
+                    │
+                    ▼
+    ┌───────────────────────────────────────────────────────────────┐
+    │                     SUB-LLM CALLS (depth=1)                   │
+    │                                                               │
+    │   ┌─────────────┐  ┌─────────────┐  ┌─────────────┐          │
+    │   │  Sub-LLM 1  │  │  Sub-LLM 2  │  │  Sub-LLM 3  │   ...    │
+    │   │             │  │             │  │             │          │
+    │   │ "Chunk 1 is │  │ "Chunk 2 is │  │ "Chunk 3 is │          │
+    │   │  about      │  │  about      │  │  about      │          │
+    │   │  tokeniza-  │  │  attention  │  │  training"  │          │
+    │   │  tion"      │  │  mechanism" │  │             │          │
+    │   └──────┬──────┘  └──────┬──────┘  └──────┬──────┘          │
+    │          │                │                │                 │
+    └──────────│────────────────│────────────────│─────────────────┘
+               │                │                │
+               └────────────────┼────────────────┘
+                                │
+                                ▼
+    ┌───────────────────────────────────────────────────────────────┐
+    │                    ROOT LLM AGGREGATES                        │
+    │                                                               │
+    │   "Based on my sub-LLMs:                                      │
+    │    - Chunk 1: tokenization                                    │
+    │    - Chunk 2: attention                                       │
+    │    - Chunk 3: training                                        │
+    │                                                               │
+    │    The document explains how transformers work!"              │
+    │                                                               │
+    │    FINAL("This is a technical explanation of transformers")   │
+    └───────────────────────────────────────────────────────────────┘
+```
+
+### Step-by-Step Flow
+
+```
+STEP 1: You ask a question
+─────────────────────────────────────────────────────────────
+    YOU ──► "What is this document about?"
+            + context.txt (stored locally, NOT sent to LLM)
+
+
+STEP 2: RLM tells LLM about the environment
+─────────────────────────────────────────────────────────────
+    SYSTEM ──► "You have a variable 'context' with 76,543 chars.
+               You can write Python code to explore it.
+               You can call llm_query() to ask sub-LLMs."
+
+
+STEP 3: LLM writes code to explore
+─────────────────────────────────────────────────────────────
+    LLM ──► ```python
+            print(context[:1000])  # See the start
+            print(context[-1000:]) # See the end
+            ```
+
+
+STEP 4: Code runs locally, output sent back
+─────────────────────────────────────────────────────────────
+    REPL ──► "A decoder-only transformer begins..."
+             (only 1000 chars sent, not 76,543!)
+
+
+STEP 5: LLM decides to use sub-LLMs for deep analysis
+─────────────────────────────────────────────────────────────
+    LLM ──► ```python
+            summary = llm_query(f"Summarize: {context[0:20000]}")
+            print(summary)
+            ```
+
+
+STEP 6: Sub-LLM processes the chunk
+─────────────────────────────────────────────────────────────
+    SUB-LLM ──► "This section explains tokenization and
+                 embedding in transformers."
+
+
+STEP 7: Root LLM gets result, continues or finishes
+─────────────────────────────────────────────────────────────
+    LLM ──► FINAL("The document is a technical deep-dive
+                   explaining how decoder-only transformers work,
+                   covering tokenization, attention, and training.")
+```
+
+### Why "Recursive"?
+
+```
+                    ┌─────────────────┐
+                    │    ROOT LLM     │  ◄── Main "brain"
+                    │   (depth = 0)   │
+                    └────────┬────────┘
+                             │
+              ┌──────────────┼──────────────┐
+              │              │              │
+              ▼              ▼              ▼
+        ┌──────────┐   ┌──────────┐   ┌──────────┐
+        │ Sub-LLM  │   │ Sub-LLM  │   │ Sub-LLM  │  ◄── "Helper" brains
+        │(depth=1) │   │(depth=1) │   │(depth=1) │
+        └──────────┘   └──────────┘   └──────────┘
+
+The LLM calls ITSELF (or a smaller version) on sub-problems.
+That's the "recursive" part - like a function calling itself!
+```
+
+### What Gets Sent Where (The Magic)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  STAYS ON YOUR MACHINE              │  GOES TO LLM (small!)    │
+├─────────────────────────────────────┼──────────────────────────┤
+│                                     │                          │
+│  • Full 2MB document                │  • Your question         │
+│  • All chunks                       │  • System prompt         │
+│  • Search index                     │  • Tool definitions      │
+│                                     │  • Small code outputs    │
+│                                     │  • Sub-LLM responses     │
+│                                     │                          │
+│  ████████████████████████           │  ░░░░                    │
+│  ████████████████████████           │                          │
+│  ████████████████████████           │                          │
+│                                     │                          │
+└─────────────────────────────────────┴──────────────────────────┘
+         HUGE (never sent)                    TINY (fits!)
+```
+
+---
+
 ## Two Modes
 
 ### Tool-Based Mode (Default)
@@ -45,6 +282,23 @@ Uses native tool calling via the chat API. Works with servers that have tool cal
 
 ### REPL-Based Mode (--repl flag)
 Uses Python code execution. Works with servers that don't intercept tool calls.
+
+**REPL Mode** (`--repl`): LLM writes actual Python code
+```python
+# LLM literally writes this:
+chunk = context[5000:6000]
+answer = llm_query(f"What topic? {chunk}")
+print(answer)
+```
+
+**Tool Mode** (default): LLM calls predefined functions
+```
+LLM calls: search("attention")     → Returns matches
+LLM calls: read_chunk(3)           → Returns chunk #3
+LLM calls: final_answer("...")     → Done!
+```
+
+---
 
 ## Usage
 
@@ -75,7 +329,9 @@ rlm = RLM(verbose=True)
 answer = rlm.query("Find the answer", context_string)
 ```
 
-## How It Works
+---
+
+## How It Works (Technical)
 
 **Core Insight:** Context is stored locally. The LLM explores it programmatically via tools, requesting only relevant chunks. This bypasses context window limitations.
 
@@ -127,6 +383,8 @@ answer = rlm.query("Find the answer", context_string)
 4. **Send back:** Tool result as message
 5. **Repeat:** Until LLM calls `final_answer()`
 
+---
+
 ## The Tools
 
 Functions the LLM can call to explore your context:
@@ -138,29 +396,7 @@ Functions the LLM can call to explore your context:
 | `search(query)` | Finds matches, returns excerpts with positions |
 | `final_answer(answer)` | Signals completion with the answer |
 
-## REPL vs Tools: Two Approaches, Same Concept
-
-### Original REPL Approach (--repl flag)
-LLM writes Python code to explore context:
-```python
-print(len(context))           # Check size
-print(context[0:500])         # Read start
-idx = context.find("magic")   # Search
-print(context[idx:idx+100])   # Read around match
-```
-We execute it, send output back. Repeat until `FINAL(answer)`.
-
-### Tool Approach (default)
-LLM calls predefined functions:
-```
-get_context_info()        → returns size, preview
-search("magic")           → returns matches with positions
-read_chunk(2)             → returns chunk content
-final_answer("42")        → done
-```
-We execute handlers locally, send results back. Repeat until `final_answer()`.
-
-**Same concept, different mechanism.** Both let the LLM programmatically explore data it can't see all at once.
+---
 
 ## Why Tools/REPL Are Vital
 
@@ -189,6 +425,8 @@ What goes to LLM:          What stays local:
 ```
 
 The LLM becomes a **navigator**, not a reader. It decides what to look at; actual data stays local until requested.
+
+---
 
 ## Code Flow
 
@@ -220,6 +458,8 @@ rlm_tools.py                    client_tools.py              Ollama Server
 - `client_tools.py:41-58` → Sends tools to Ollama
 - `rlm_tools.py:119-170` → Main loop orchestrating everything
 
+---
+
 ## Key Files
 
 - **client_tools.py**: Chat API with tool calling support
@@ -227,3 +467,12 @@ rlm_tools.py                    client_tools.py              Ollama Server
 - **rlm_tools.py**: Tool-based orchestrator (default mode)
 - **rlm_core.py**: REPL-based orchestrator (--repl mode)
 - **repl.py**: Python REPL environment for code execution
+
+---
+
+## Paper Reference
+
+Based on: "Recursive Language Models" (arXiv:2512.24601, Dec 2025)
+- Authors: Alex L. Zhang, Tim Kraska, Omar Khattab (MIT CSAIL)
+- Key result: RLMs handle inputs up to 10M+ tokens (100x beyond context windows)
+- Performance: 91.3% on BrowseComp+ vs 0% for base GPT-5 (can't fit in context)
